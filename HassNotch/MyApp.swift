@@ -303,11 +303,36 @@ struct NotchView: View {
         Array(CollapsedPosition.layout(displayed, style: style).values)
     }
 
-    /// Dynamic Island keeps its width; the notch only widens when it has something to show.
-    static func collapsedWidth(style: NotchStyle, base: CGFloat, displayed: [DisplayedEntity]) -> CGFloat {
-        guard style == .notch, !collapsedSlots(displayed, style: style).isEmpty else { return base }
-        return base + 2 * wing
+    /// The notch only widens when it has something to show.
+    /// Dynamic Island adapts to its values: it widens when a value doesn't fit (but never beyond
+    /// the expanded island) and shrinks to a minimum — icon + "100" + "%" — when there is nothing to show.
+    static func collapsedWidth(style: NotchStyle, base: CGFloat, height: CGFloat,
+                               displayed: [DisplayedEntity]) -> CGFloat {
+        let slots = collapsedSlots(displayed, style: style)
+        switch style {
+        case .notch:
+            return slots.isEmpty ? base : base + 2 * wing
+        case .island:
+            let fontSize = islandFontSize(height: height)
+            guard !slots.isEmpty else {
+                return min(base, islandPadding * 2 + CollapsedValueView.neededWidth(text: "100", percent: true, fontSize: fontSize))
+            }
+            let widest = slots.map { slot -> CGFloat in
+                let entity = HomeAssistantManager.shared.entity(slot.entityID)
+                return CollapsedValueView.neededWidth(text: entity?.valueText ?? "—",
+                                                      percent: CollapsedValueView.showsPercent(entity),
+                                                      fontSize: fontSize)
+            }.max() ?? 0
+            // Three equal slots keep the island symmetric.
+            let slot = max(widest, (base - islandPadding * 2) / 3)
+            return min(islandPadding * 2 + slot * 3, islandWindowWidth)
+        }
     }
+
+    /// Horizontal padding inside the collapsed Dynamic Island.
+    static let islandPadding: CGFloat = 8
+    /// Digit size on the collapsed Dynamic Island.
+    static func islandFontSize(height: CGFloat) -> CGFloat { max(8, height * 0.46) }
 
     /// Width of the Dynamic Island window (expanded island).
     static let islandWindowWidth: CGFloat = 460
@@ -324,11 +349,11 @@ struct NotchView: View {
 
     static func collapsedShapeSize(style: NotchStyle, base: CGSize, displayed: [DisplayedEntity],
                                    hasNotification: Bool, attention: Bool = false) -> CGSize {
-        let width = collapsedWidth(style: style, base: base.width, displayed: displayed)
+        let width = collapsedWidth(style: style, base: base.width, height: base.height, displayed: displayed)
         guard hasNotification else { return CGSize(width: width, height: base.height) }
         switch style {
         case .island:
-            return CGSize(width: base.width * 2,
+            return CGSize(width: max(width, base.width * 2),
                           height: attention ? base.height * islandAttentionScale : base.height)
         case .notch:
             return CGSize(width: max(width, 260),
@@ -369,7 +394,7 @@ struct NotchView: View {
                                    icon: slot.icon.isEmpty ? EntityIcons.automatic(for: entity) : slot.icon,
                                    slotID: slot.id,
                                    morph: morphSpace,
-                                   fontSize: style == .notch ? 12 : max(8, collapsedSize.height * 0.46),
+                                   fontSize: style == .notch ? 12 : Self.islandFontSize(height: collapsedSize.height),
                                    maxWidth: width)
             } else {
                 Color.clear
@@ -384,13 +409,15 @@ struct NotchView: View {
         let layout = CollapsedPosition.layout(manager.displayed, style: style)
         switch style {
         case .island:
-            let third = (collapsedSize.width - 16) / 3
+            let width = Self.collapsedWidth(style: style, base: collapsedSize.width,
+                                            height: collapsedSize.height, displayed: manager.displayed)
+            let third = (width - Self.islandPadding * 2) / 3
             HStack(spacing: 0) {
                 collapsedValue(layout[.left], width: third)
                 collapsedValue(layout[.center], width: third)
                 collapsedValue(layout[.right], width: third)
             }
-            .padding(.horizontal, 8)
+            .padding(.horizontal, Self.islandPadding)
         case .notch:
             HStack(spacing: 0) {
                 collapsedValue(layout[.left], width: Self.wing - 8)
@@ -436,6 +463,8 @@ struct NotchView: View {
                 width: isExpanded ? expandedWidth : collapsedWidth,
                 height: isExpanded ? expandedHeight : collapsedShape.height
             )
+            // The collapsed island widens / narrows smoothly as its values change.
+            .animation(.smooth(duration: 0.45), value: collapsedWidth)
             .overlay(alignment: .top) {
                 if isExpanded {
                     Group {
@@ -584,11 +613,35 @@ struct CollapsedValueView: View {
     }
 
     /// For batteries (device class "battery" or "battery/baterie/soc" in the name) a "%" follows the digits.
-    private var showsPercent: Bool {
+    private var showsPercent: Bool { Self.showsPercent(entity) }
+
+    static func showsPercent(_ entity: HAEntity?) -> Bool {
         guard let entity, entity.numericValue != nil, entity.attributes.unit_of_measurement == "%" else { return false }
         if entity.attributes.device_class == "battery" { return true }
         let text = (entity.entity_id + " " + entity.name).lowercased()
         return ["batter", "baterie", "soc", "state_of_charge"].contains { text.contains($0) }
+    }
+
+    /// Width a value needs at full size: icon + spacing + digits (decimals at 60%) + optional "%".
+    static func neededWidth(text: String, percent: Bool, fontSize: CGFloat) -> CGFloat {
+        fontSize * 1.1 + fontSize * 0.25 + digitsWidth(text, fontSize: fontSize)
+            + (percent ? fontSize * 0.75 : 0) + 6
+    }
+
+    /// Measured width of the digits, using the same font as on the island.
+    static func digitsWidth(_ text: String, fontSize: CGFloat) -> CGFloat {
+        func font(_ size: CGFloat) -> NSFont {
+            let base = NSFont.monospacedDigitSystemFont(ofSize: size, weight: .bold)
+            if let rounded = base.fontDescriptor.withDesign(.rounded),
+               let font = NSFont(descriptor: rounded, size: size) { return font }
+            return base
+        }
+        func width(_ part: Substring, _ size: CGFloat) -> CGFloat {
+            ceil((String(part) as NSString).size(withAttributes: [.font: font(size)]).width)
+        }
+        let separator = Character(Locale.current.decimalSeparator ?? ",")
+        guard let index = text.firstIndex(of: separator) else { return width(text[...], fontSize) }
+        return width(text[..<index], fontSize) + width(text[index...], fontSize * 0.6)
     }
 
     var body: some View {
